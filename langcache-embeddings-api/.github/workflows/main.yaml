@@ -1,0 +1,182 @@
+name: main
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+
+jobs:
+  docker-build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    outputs:
+        version: ${{ steps.artifact.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-test.txt
+
+      - name: Run Tests
+        run: pytest -v
+
+      - name: Resolve image tag
+        id: artifact
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+            # Strip 'v' prefix if present
+            VERSION=${VERSION#v}
+          else
+            VERSION=${GITHUB_SHA:0:7}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using version: $VERSION"
+
+      - name: build Docker image
+        run: |
+          docker build -t langcache-embeddings-api:latest .
+
+      - name: Push container image to registry
+        if: ${{ startsWith(github.ref, 'refs/tags/') || github.ref_name == 'main' }}
+        run: |
+          docker image ls -a
+          IMAGE_NAME="${{ vars.OCI_REGISTRY_URL }}/${{ vars.OCI_REGISTRY_REPOSITORY_NAME }}/langcache-embeddings-api:${{ steps.artifact.outputs.version }}"
+
+          docker tag langcache-embeddings-api:latest "$IMAGE_NAME"
+
+          if [ "${{ vars.OCI_REGISTRY_IS_INSECURE }}" == "true" ]; then
+            export DOCKER_OPTS+=" --insecure-registry ${{ vars.OCI_REGISTRY_URL }}"
+          fi
+
+          echo ${{ secrets.OCI_REGISTRY_PASSWORD }} | docker login --username ${{ secrets.OCI_REGISTRY_USERNAME }} --password-stdin ${{ vars.OCI_REGISTRY_URL }}
+          docker push $IMAGE_NAME
+
+  deploy:
+    name: Deploy LangCache Embeddings API service on MW QA environment
+    runs-on: ubuntu-latest
+    needs:
+      - docker-build
+    if: ${{ startsWith(github.ref, 'refs/tags/') || github.ref_name == 'main' }}
+    strategy:
+      matrix:
+        environment: [dev, qa]
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: Generate GH Token
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ vars.GH_CI_APP_ID }}
+          private-key: ${{ secrets.GH_CI_PRIVATE_KEY }}
+          owner: redislabsdev
+
+      - name: Deploy LangCache Embeddings API service
+        id: deploy-embeddings-api-service
+        uses: redislabsdev/github-actions-shared/actions/deploy-argo-cd@main
+        timeout-minutes: 10
+        with:
+          build_number: ${{ needs.docker-build.outputs.version }}
+          namespace: ${{ vars.DEPLOYMENT_NAMESPACE }}
+          cluster: ${{ vars.DEPLOYMENT_CLUSTER }}
+          resource: "rais-langcache"
+          image_tag: ".rais-langcache-embeddings-api.image.tag"
+          git_token: ${{ steps.app-token.outputs.token }}
+          argo_cli_user: "${{ vars.ARGO_CLI_USERNAME }}"
+          argo_cli_token: "${{ secrets.ARGO_CLI_TOKEN }}"
+
+  deploy-staging:
+    name: Deploy LangCache Embeddings API service on Staging environment
+    if: ${{ github.ref_name == 'main' }}
+    runs-on: ubuntu-latest
+    needs:
+      - docker-build
+    environment: staging
+    steps:
+      - name: Generate GH Token
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ vars.GH_CI_APP_ID }}
+          private-key: ${{ secrets.GH_CI_PRIVATE_KEY }}
+          owner: redislabsdev
+
+      - name: Publish from Artifactory to Docker
+        uses: redislabsdev/langcache-common/.github/actions/publish-to-docker@main
+        with:
+          artifactory_username: ${{ vars.ARTIFACTORY_PUSH_USERNAME }}
+          artifactory_password: ${{ secrets.ARTIFACTORY_PUSH_TOKEN }}
+          docker_username: ${{ vars.DOCKERHUB_PUSH_USERNAME }}
+          docker_password: ${{ secrets.DOCKERHUB_PUSH_TOKEN }}
+          src_image: artifactory.dev.redislabs.com/cloud-docker-dev-local/langcache-embeddings-api:${{ needs.docker-build.outputs.version }}
+          dest_image: docker.io/redislabs/langcache-embeddings-api:${{ needs.docker-build.outputs.version }}
+
+      - name: Docker Scout validation
+        id: docker-scout
+        uses: docker/scout-action@v1
+        with:
+          command: cves,recommendations
+          image: docker.io/redislabs/langcache-embeddings-api:${{ needs.docker-build.outputs.version }}
+          exit-code: true
+          organization: redislabs
+          dockerhub-user: ${{ vars.DOCKERHUB_PUSH_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_PUSH_TOKEN }}
+
+      - name: Update Embeddings API Helm Chart version
+        id: deploy-embeddings-api-service
+        uses: redislabsdev/github-actions-shared/actions/update-cloud-deployment-app-version@main
+        timeout-minutes: 10
+        with:
+          build_number: ${{ needs.docker-build.outputs.version }}
+          namespaces: ${{ vars.DEPLOYMENT_NAMESPACE }}
+          cluster: ${{ vars.DEPLOYMENT_CLUSTER }}
+          resource: "rais-langcache"
+          image_tag: ".rais-langcache-embeddings-api.image.tag"
+          git_token: ${{ steps.app-token.outputs.token }}
+          should_auto_merge: true
+
+      - name: Sync Embeddings API Service in ArgoCD
+        uses: redislabsdev/github-actions-shared/actions/sync-argo-cd@main
+        timeout-minutes: 10
+        with:
+          namespaces: ${{ vars.DEPLOYMENT_NAMESPACE }}
+          resource: "rais-langcache"
+          argo_cd_environment: argocd-cloud-k8s-staging.qa.redislabs.com
+          argo_cli_user: "${{ vars.ARGO_CLI_USERNAME }}"
+          argo_cli_token: "${{ secrets.ARGO_CLI_TOKEN }}"
+
+  deploy-prod:
+    name: Deploy LangCache Embeddings API service on Production environment
+    if: ${{ github.ref_name == 'main' }}
+    runs-on: ubuntu-latest
+    needs:
+      - docker-build
+      - deploy-staging
+    environment: production
+    steps:
+      - name: Generate GH Token
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ vars.GH_CI_APP_ID }}
+          private-key: ${{ secrets.GH_CI_PRIVATE_KEY }}
+          owner: redislabsdev
+
+      - name: Deploy LangCache Embeddings API service
+        id: deploy-embeddings-api-service
+        uses: redislabsdev/github-actions-shared/actions/update-cloud-deployment-app-version@main
+        timeout-minutes: 10
+        with:
+          build_number: ${{ needs.docker-build.outputs.version }}
+          namespaces: ${{ vars.DEPLOYMENT_NAMESPACE }}
+          cluster: ${{ vars.DEPLOYMENT_CLUSTER }}
+          resource: "rais-langcache"
+          image_tag: ".rais-langcache-embeddings-api.image.tag"
+          git_token: ${{ steps.app-token.outputs.token }}

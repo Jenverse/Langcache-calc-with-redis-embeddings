@@ -1,0 +1,16 @@
+name: Validate PR Standards
+
+on:
+  pull_request:
+    types: [opened, synchronize, edited]
+
+jobs:
+  validate_pr_standards:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR standards
+        uses: redislabsdev/github-actions-shared/actions/validate-pr-standards@main
+        with:
+          validate_jira_ticket: "true"
+          jira_api_token: ${{ secrets.JIRA_TOKEN }}
+          jira_user_email: ${{ vars.JIRA_USER_EMAIL }}

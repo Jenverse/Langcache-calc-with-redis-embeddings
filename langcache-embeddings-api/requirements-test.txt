@@ -1,0 +1,4 @@
+# Minimal dependencies needed for running tests
+pytest==8.4.1
+fastapi==0.115.12
+httpx==0.28.1
